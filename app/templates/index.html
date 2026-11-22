@@ -35,6 +35,30 @@
 </section>
 
 <section class="card">
+  <h2>③ 清理旧抓存（试算 → 确认）</h2>
+  <p class="hint">按整批清理截止时刻及更早的抓存；仍被已保存结论依赖的批次会被标出并保留。
+  同一 URL 在不同回看时刻用到的替代抓存会分别核对。</p>
+  <p><a class="button-link" href="{{ url_for('main.cleanup_new') }}">进入清理试算</a></p>
+  {% if cleanups %}
+  <table>
+    <thead><tr><th>#</th><th>截止时刻 (UTC)</th><th>删除批次</th><th>删除抓存</th><th>执行时间 (UTC)</th><th></th></tr></thead>
+    <tbody>
+    {% for c in cleanups %}
+      <tr>
+        <td>{{ c.id }}</td>
+        <td>{{ fmt_us(c.cutoff) }}</td>
+        <td>{{ c.deleted_batch_count }}</td>
+        <td>{{ c.deleted_capture_count }}</td>
+        <td>{{ fmt_us(c.created_at) }}</td>
+        <td><a href="{{ url_for('main.cleanup_result', cid=c.id) }}">查看</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<section class="card">
   <h2>核查结论</h2>
   {% if reports %}
   <table>

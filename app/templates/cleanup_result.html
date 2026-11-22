@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}清理结果 #{{ cleanup.id }}{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>清理结果 #{{ cleanup.id }}</h2>
+  <dl class="meta">
+    <dt>截止时刻 (UTC)</dt><dd>{{ fmt_us(cleanup.cutoff) }}</dd>
+    <dt>执行时间 (UTC)</dt><dd>{{ fmt_us(cleanup.created_at) }}</dd>
+    <dt>删除批次</dt><dd>{{ cleanup.deleted_batch_count }} 个</dd>
+    <dt>删除抓存</dt><dd>{{ cleanup.deleted_capture_count }} 条</dd>
+    <dt>来源试算</dt><dd><a href="{{ url_for('main.cleanup_detail', pid=cleanup.preview_id) }}">#{{ cleanup.preview_id }}</a></dd>
+  </dl>
+  <p class="hint">删除与清理结果在同一事务内生效；若任何已保存结论会因此变化，本次清理会被整体取消。</p>
+</section>
+
+<section class="card">
+  <h2>已删除的批次与抓存</h2>
+  {% if detail.batches %}
+  <table>
+    <thead><tr><th>批次</th><th>文件名</th><th>删除的抓存</th></tr></thead>
+    <tbody>
+    {% for b in detail.batches %}
+      <tr>
+        <td>#{{ b.batch_id }}</td>
+        <td>{{ b.filename }}</td>
+        <td class="url">
+          {% for c in b.captures %}
+            {{ c.url }} @ {{ fmt_us(c.captured_at) }}{% if not loop.last %}<br>{% endif %}
+          {% endfor %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">本次没有删除批次。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <details>
+    <summary>保留批次及依赖说明（{{ detail.kept|length }}）</summary>
+    <table>
+      <thead><tr><th>批次</th><th>文件名</th><th>原因</th></tr></thead>
+      <tbody>
+      {% for p in detail.kept %}
+        <tr>
+          <td>#{{ p.batch_id }}</td>
+          <td>{{ p.filename }}</td>
+          <td>{% for r in p.reasons %}{{ r }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </details>
+</section>
+{% endblock %}

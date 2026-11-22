@@ -16,3 +16,4 @@ services:
 
 volumes:
   archive_data:
+    # 演示卷；实际部署可改为绑定挂载到馆内备份目录

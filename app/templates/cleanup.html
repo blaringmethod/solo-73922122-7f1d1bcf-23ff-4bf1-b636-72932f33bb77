@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}清理试算{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>清理旧网站抓存：试算</h2>
+  <p class="hint">
+    输入 UTC 截止时刻：只有<strong>整批</strong>抓存都不晚于该时刻、且不被任何已保存结论依赖的批次，
+    才会进入可删清单。截止后的抓存、已退回批次、被结论引用的抓存一律保留。
+    试算只读，不删除任何数据。
+  </p>
+  <form method="post" action="{{ url_for('main.cleanup_preview') }}" class="check-form">
+    <label>截止时刻（UTC）
+      <input type="datetime-local" name="cutoff" step="1" required>
+    </label>
+    <button type="submit">生成清理试算</button>
+  </form>
+  <p class="hint">
+    确认时会先核对目录与结论是否在试算后发生变化；有变化则拒绝，需重新试算。
+  </p>
+</section>
+
+{% if cleanups %}
+<section class="card">
+  <h2>最近清理结果</h2>
+  <table>
+    <thead><tr><th>#</th><th>截止时刻 (UTC)</th><th>删除批次</th><th>删除抓存</th><th>执行时间 (UTC)</th><th></th></tr></thead>
+    <tbody>
+    {% for c in cleanups %}
+      <tr>
+        <td>{{ c.id }}</td>
+        <td>{{ fmt_us(c.cutoff) }}</td>
+        <td>{{ c.deleted_batch_count }}</td>
+        <td>{{ c.deleted_capture_count }}</td>
+        <td>{{ fmt_us(c.created_at) }}</td>
+        <td><a href="{{ url_for('main.cleanup_result', cid=c.id) }}">查看</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+{% endblock %}

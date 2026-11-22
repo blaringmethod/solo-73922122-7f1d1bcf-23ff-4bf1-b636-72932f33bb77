@@ -66,3 +66,18 @@ dl.meta dt { color: #6a737d; }
 dl.meta dd { margin: 0; }
 .path .step { background: #f0f2f5; border-radius: 4px; padding: .05rem .3rem; }
 code { background: #f0f2f5; border-radius: 4px; padding: .05rem .3rem; }
+a.button-link {
+  display: inline-block;
+  background: #2c6fbb;
+  color: #fff;
+  border-radius: 6px;
+  padding: .45rem 1.1rem;
+  text-decoration: none;
+  font-size: .9rem;
+}
+a.button-link:hover { background: #245b9c; }
+ul.reasons { margin: .1rem 0 .3rem; padding-left: 1.1rem; }
+table.nested { margin-top: .4rem; font-size: .82rem; }
+table.nested th { background: #f7f8fa; }
+button.secondary { background: #8a94a0; }
+button.secondary:hover { background: #6a737d; }

@@ -8,6 +8,7 @@
 - 同一 URL 同一时刻、出链不同的记录视为冲突，整批退回，不产生任何效果。
 """
 import csv
+import hashlib
 import io
 import json
 import time
@@ -18,6 +19,11 @@ from urllib.parse import urlparse
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 REQUIRED_COLUMNS = ("url", "captured_at", "outlinks")
+
+# 清理试算里的整批分类
+KIND_CAPTURE = "capture"    # 可删：已生效，整批抓存都不晚于截止时刻且不被结论依赖
+KIND_REJECTED = "rejected"  # 留作审计：整批退回、从未生效的批次
+KIND_KEEP = "keep"          # 保留：有晚于截止时刻的抓存，或被已保存的结论依赖
 
 # ---------------------------------------------------------------- 时间工具
 
@@ -263,6 +269,38 @@ def apply_batch(conn, filename, rows):
 # ---------------------------------------------------------------- 断链核查
 
 
+def _walk_check(conn, entry_url, lookback_us, step_delay=0.0):
+    """在调用方已开启的事务内完成遍历（不自行 BEGIN/COMMIT）。"""
+    base_batch = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM batches WHERE applied = 1"
+    ).fetchone()[0]
+    visited = {}
+    missing = {}
+    queue = deque([(entry_url, [entry_url])])
+    enqueued = {entry_url}
+    while queue:
+        url, path = queue.popleft()
+        if url in visited or url in missing:
+            continue
+        row = conn.execute(
+            "SELECT id, captured_at, outlinks FROM captures"
+            " WHERE url=? AND captured_at<=?"
+            " ORDER BY captured_at DESC, id DESC LIMIT 1",
+            (url, lookback_us),
+        ).fetchone()
+        if row is None:
+            missing[url] = path
+        else:
+            visited[url] = (row["id"], row["captured_at"])
+            for link in json.loads(row["outlinks"]):
+                if link not in enqueued and link not in visited and link not in missing:
+                    enqueued.add(link)
+                    queue.append((link, path + [link]))
+        if step_delay:
+            time.sleep(step_delay)
+    return base_batch, visited, missing
+
+
 def run_check(conn, entry_url, lookback_us, step_delay=0.0):
     """在同一目录快照上从入口沿出链逐页核查（BFS，互链只查一遍）。
 
@@ -274,35 +312,9 @@ def run_check(conn, entry_url, lookback_us, step_delay=0.0):
     """
     conn.execute("BEGIN")  # 只读快照事务；WAL 下不阻塞并发补传
     try:
-        base_batch = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM batches WHERE applied = 1"
-        ).fetchone()[0]
-        visited = {}
-        missing = {}
-        queue = deque([(entry_url, [entry_url])])
-        enqueued = {entry_url}
-        while queue:
-            url, path = queue.popleft()
-            if url in visited or url in missing:
-                continue
-            row = conn.execute(
-                "SELECT id, captured_at, outlinks FROM captures"
-                " WHERE url=? AND captured_at<=?"
-                " ORDER BY captured_at DESC, id DESC LIMIT 1",
-                (url, lookback_us),
-            ).fetchone()
-            if row is None:
-                missing[url] = path
-            else:
-                visited[url] = (row["id"], row["captured_at"])
-                for link in json.loads(row["outlinks"]):
-                    if link not in enqueued and link not in visited and link not in missing:
-                        enqueued.add(link)
-                        queue.append((link, path + [link]))
-            if step_delay:
-                time.sleep(step_delay)
+        result = _walk_check(conn, entry_url, lookback_us, step_delay)
         conn.execute("COMMIT")
-        return base_batch, visited, missing
+        return result
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -351,6 +363,425 @@ def save_report(conn, entry_url, lookback_us, base_batch, visited, missing):
         conn.execute(REVALIDATE_SQL, (rid, rid, base_batch, lookback_us))
         conn.execute("COMMIT")
         return rid
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------- 清理试算与确认
+#
+# 目标：馆员清理旧网站抓存时，已保存的断链结论必须仍能复查。
+#
+# 清理粒度是"整批"——一个批次要么整批删除，要么整批保留。只有同时满足以下
+# 条件的已生效批次才可删：
+#   1. 批内每一条抓存都不晚于清理截止时刻（截止后的抓存不动）；
+#   2. 批内没有任何一条抓存是任一已保存结论的"所选抓存"。结论的逐页明细
+#      记录着 capture_id；同一 URL 在不同回看时刻可能选中不同批次的抓存，
+#      因此不能按 URL 一概而论，必须逐份核对每个结论实际选中的抓存。
+# 缺档 URL 和到达路径不需要额外保护：删除抓存只会让可用抓存变少，不会凭空
+# 补上缺口；已查页面所选抓存都保留时，遍历结果（含路径）必然不变。
+#
+# 确认时先比对试算指纹：试算后目录或结论有任何变化（补传、重查、状态变化、
+# 新增结论）就拒绝。否则在同一个写事务里删批次+抓存、写清理结果，并比较
+# 删除前后"每条结论按原入口/回看时刻重查"的结果；任何一步失败整体回滚。
+
+KIND_CAPTURE = "capture"    # 可删：整批可删的已生效批次
+KIND_REJECTED = "rejected"  # 留作审计：整批退回、从未生效的批次
+KIND_KEEP = "keep"          # 保留：截止后的抓存、被结论依赖，或空批次留痕
+
+CLEANUP_PLAN_VERSION = 1
+
+
+def _fingerprint(conn):
+    """目录（批次 + 抓存）与结论（报告 + 逐页明细）的摘要。
+
+    任何可能影响"哪些批次可删"或"结论能否复查"的变化都会改变摘要：
+    补传、批次退回、新增/重查结论、结论状态变化、逐页明细变化。
+    """
+    h = hashlib.sha256()
+
+    def add(tag, value):
+        h.update(tag.encode("utf-8"))
+        h.update(b"\x1f")
+        h.update(str(value).encode("utf-8"))
+        h.update(b"\x1e")
+
+    for b in conn.execute(
+        "SELECT id, applied, row_count, error FROM batches ORDER BY id"
+    ):
+        add("b", (b["id"], b["applied"], b["row_count"], b["error"]))
+    for c in conn.execute(
+        "SELECT id, batch_id, url, captured_at, outlinks FROM captures ORDER BY id"
+    ):
+        add("c", (c["id"], c["batch_id"], c["url"], c["captured_at"], c["outlinks"]))
+    for r in conn.execute(
+        "SELECT id, entry_url, lookback, base_batch, status, visited_count,"
+        " missing_count FROM reports ORDER BY id"
+    ):
+        add("r", tuple(r))
+    for p in conn.execute(
+        "SELECT report_id, url, captured_at, capture_id, path FROM report_pages"
+        " ORDER BY report_id, url"
+    ):
+        add("p", tuple(p))
+    return h.hexdigest()
+
+
+def fingerprint_of(conn):
+    """当前目录与结论的指纹（供页面判断试算是否已过时）。"""
+    return _fingerprint(conn)
+
+
+def _batch_plans(conn, cutoff_us):
+    """按截止时刻给每个批次分类，返回 {batch_id: 计划项}。"""
+    plans = {}
+    for b in conn.execute(
+        "SELECT id, uploaded_at, filename, row_count, applied, error"
+        " FROM batches ORDER BY id"
+    ):
+        plans[b["id"]] = {
+            "batch_id": b["id"],
+            "filename": b["filename"],
+            "uploaded_at": b["uploaded_at"],
+            "row_count": b["row_count"],
+            "applied": bool(b["applied"]),
+            "error": b["error"],
+            "capture_count": 0,
+            "deletable_count": 0,
+            "late_count": 0,
+            "latest_capture": None,    # 批次内最晚抓存（UTC 微秒）
+            "kind": KIND_REJECTED if not b["applied"] else KIND_CAPTURE,
+            "reasons": (
+                ["整批退回的批次留作审计，不参与清理"] if not b["applied"] else []
+            ),
+            # [{report_id, lookback, url, capture_id, captured_at, source}]
+            "dependencies": [],
+        }
+    for c in conn.execute("SELECT batch_id, captured_at FROM captures ORDER BY id"):
+        p = plans[c["batch_id"]]
+        p["capture_count"] += 1
+        cat = c["captured_at"]
+        if p["latest_capture"] is None or cat > p["latest_capture"]:
+            p["latest_capture"] = cat
+        if cat <= cutoff_us:
+            p["deletable_count"] += 1
+        else:
+            p["late_count"] += 1
+    for p in plans.values():
+        if p["kind"] == KIND_CAPTURE and p["late_count"]:
+            p["kind"] = KIND_KEEP
+            p["reasons"].append(
+                f"批次内有 {p['late_count']} 条抓存晚于截止时刻，不能整批删除"
+            )
+        if p["kind"] == KIND_CAPTURE and p["capture_count"] == 0:
+            p["kind"] = KIND_KEEP
+            p["reasons"].append("批次没有抓存记录，保留批次留痕")
+    return plans
+
+
+def _walk_for_reports(conn):
+    """按每条已保存结论的原入口/回看时刻重新遍历，返回 {report_id: (visited, missing)}。
+
+    这是"结论此刻再查一遍会得到什么"的基线：清理只允许删除不会改变这份基线的
+    抓存，因此同时也覆盖了同一 URL 在不同回看时刻选中不同替代抓存的情形。
+    """
+    out = {}
+    for rep in conn.execute(
+        "SELECT id, entry_url, lookback FROM reports ORDER BY id"
+    ):
+        _base, visited, missing = _walk_check(conn, rep["entry_url"], rep["lookback"])
+        out[rep["id"]] = (visited, missing)
+    return out
+
+
+def _apply_dependencies(conn, plans, rechecks):
+    """标出每个批次仍被哪些已保存结论依赖。
+
+    保护集合取并集：
+    - 已保存结论逐页明细里记录的 capture_id（结论当时所选抓存，删了明细指空）；
+    - 按每条结论原入口/回看时刻重查时实际会选中的 capture_id（含同一 URL 在
+      不同回看时刻各自选中的替代抓存）。
+    两类抓存所在批次都不可删，并在页面上逐条标出依赖它的结论。
+    """
+    reports = {
+        r["id"]: r
+        for r in conn.execute(
+            "SELECT id, entry_url, lookback, status FROM reports ORDER BY id"
+        )
+    }
+    capture_info = {}
+    for c in conn.execute(
+        "SELECT id, batch_id, url, captured_at FROM captures ORDER BY id"
+    ):
+        capture_info[c["id"]] = (c["batch_id"], c["url"], c["captured_at"])
+
+    def add(capture_id, report_id, source):
+        info = capture_info.get(capture_id)
+        if info is None:
+            return
+        bid, url, cat = info
+        p = plans.get(bid)
+        rep = reports.get(report_id)
+        if p is None or rep is None:
+            return
+        if any(
+            d["report_id"] == report_id and d["capture_id"] == capture_id
+            for d in p["dependencies"]
+        ):
+            return
+        p["dependencies"].append(
+            {
+                "report_id": report_id,
+                "entry_url": rep["entry_url"],
+                "lookback": rep["lookback"],
+                "status": rep["status"],
+                "url": url,
+                "capture_id": capture_id,
+                "captured_at": cat,
+                "source": source,
+            }
+        )
+
+    # 1) 结论落库时选中的抓存
+    for page in conn.execute(
+        "SELECT report_id, url, captured_at, capture_id FROM report_pages"
+        " WHERE capture_id IS NOT NULL ORDER BY report_id, url"
+    ):
+        add(page["capture_id"], page["report_id"], "stored")
+    # 2) 此刻重查会选中的抓存（含同一 URL 在不同回看时刻的替代抓存）
+    for rid, (visited, _missing) in rechecks.items():
+        for url, (cid, _cat) in visited.items():
+            add(cid, rid, "recheck")
+
+    for p in plans.values():
+        if not p["dependencies"]:
+            continue
+        if p["kind"] == KIND_CAPTURE:
+            p["kind"] = KIND_KEEP
+        p["reasons"].append(
+            "被已保存结论依赖：" + "、".join(
+                sorted({f"结论 #{d['report_id']}" for d in p["dependencies"]})
+            )
+        )
+
+
+def _compute_plan(conn, cutoff_us):
+    """在当前事务内计算清理计划（不自起事务、不写库）。
+
+    返回 (plan, rechecks)；rechecks 是每条结论此刻重查会得到的逐页结果，
+    既用于标注依赖，也可直接作为确认时的删除前基线，避免重复遍历。
+    """
+    plans = _batch_plans(conn, cutoff_us)
+    rechecks = _walk_for_reports(conn)
+    _apply_dependencies(conn, plans, rechecks)
+    deletable = []
+    kept = []
+    for bid in sorted(plans):
+        p = plans[bid]
+        if p["kind"] == KIND_CAPTURE:
+            p["deletable"] = True
+            deletable.append(p)
+        else:
+            p["deletable"] = False
+            kept.append(p)
+    return {
+        "version": CLEANUP_PLAN_VERSION,
+        "cutoff": cutoff_us,
+        "deletable": deletable,
+        "kept": kept,
+    }, rechecks
+
+
+def create_cleanup_preview(conn, cutoff_us):
+    """计算试算并落库，返回 (preview_id, plan)。
+
+    先在只读快照里计算（不阻塞并发补传）；落库前在写事务里核对指纹，
+    若期间目录或结论发生了变化就整份重算，保证保存的试算与其指纹一致。
+    """
+    conn.execute("BEGIN")
+    try:
+        plan, _rechecks = _compute_plan(conn, cutoff_us)
+        fp = _fingerprint(conn)
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if _fingerprint(conn) != fp:
+            # 计算之后有变化：在写事务里重算，任何并发写都无法再插入。
+            plan, _rechecks = _compute_plan(conn, cutoff_us)
+            fp = _fingerprint(conn)
+        cur = conn.execute(
+            "INSERT INTO cleanup_previews(created_at, cutoff, fingerprint, plan)"
+            " VALUES (?,?,?,?)",
+            (now_us(), cutoff_us, fp, json.dumps(plan, ensure_ascii=False)),
+        )
+        pid = cur.lastrowid
+        conn.execute("COMMIT")
+        return pid, plan
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+class CleanupRejected(Exception):
+    """确认清理被拒绝；调用方已回滚，不产生任何副作用。"""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _recheck_diff(before, after):
+    """比较清理前后的"重查结果"，返回发生变化的结论 id。
+
+    before/after 均为 {report_id: (visited, missing)}。visited 里含抓存 id 与
+    时刻，missing 里含到达路径；任何一项不同都说明结论不再能原样复查。
+    """
+    changed = []
+    for rid in sorted(set(before) | set(after)):
+        if rid not in before or rid not in after:
+            changed.append(rid)
+            continue
+        b_visited, b_missing = _normalize_check(*before[rid])
+        a_visited, a_missing = _normalize_check(*after[rid])
+        if b_visited != a_visited or b_missing != a_missing:
+            changed.append(rid)
+    return changed
+
+
+def _normalize_check(visited, missing):
+    """把一次遍历结果规范化，便于比较（字典顺序与 JSON 序列化一致）。"""
+    return (
+        {url: tuple(v) for url, v in visited.items()},
+        {url: json.dumps(path, ensure_ascii=False) for url, path in missing.items()},
+    )
+
+
+def _missing_capture_references(conn):
+    """已保存结论明细引用的抓存是否仍然存在。返回指向缺失抓存的结论 id。"""
+    rows = conn.execute(
+        "SELECT DISTINCT rp.report_id FROM report_pages rp"
+        " LEFT JOIN captures c ON c.id = rp.capture_id"
+        " WHERE rp.capture_id IS NOT NULL AND c.id IS NULL"
+    ).fetchall()
+    return [r["report_id"] for r in rows]
+
+
+def confirm_cleanup(conn, preview_id):
+    """按已保存的试算确认清理，返回结果摘要。
+
+    - 试算不存在 / 已确认过 / 试算后目录或结论变化 → CleanupRejected；
+    - 删除批次与抓存、写清理结果在同一写事务内提交；
+    - 提交前重核全部有效结论，任何变化都整体回滚，原档案保持原样。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        prev = conn.execute(
+            "SELECT * FROM cleanup_previews WHERE id=?", (preview_id,)
+        ).fetchone()
+        if prev is None:
+            raise CleanupRejected("清理试算不存在")
+        if prev["cleanup_id"] is not None:
+            raise CleanupRejected("该清理试算已确认过，不能重复执行")
+        cutoff = prev["cutoff"]
+        if _fingerprint(conn) != prev["fingerprint"]:
+            raise CleanupRejected(
+                "试算后目录或结论已发生变化，请重新试算后再确认"
+            )
+        saved = json.loads(prev["plan"])
+        current, baseline = _compute_plan(conn, cutoff)
+        expected = [p["batch_id"] for p in saved["deletable"]]
+        actual = [p["batch_id"] for p in current["deletable"]]
+        if expected != actual:
+            raise CleanupRejected(
+                "试算后目录或结论已发生变化，可删批次不再一致，请重新试算"
+            )
+
+        deleted_batches = []
+        deleted_capture_count = 0
+        for p in current["deletable"]:
+            bid = p["batch_id"]
+            rows = conn.execute(
+                "SELECT id, url, captured_at, outlinks FROM captures"
+                " WHERE batch_id=? ORDER BY captured_at, id",
+                (bid,),
+            ).fetchall()
+            if any(r["captured_at"] > cutoff for r in rows):
+                raise CleanupRejected(
+                    f"批次 #{bid} 含晚于截止时刻的抓存，不能整批删除"
+                )
+            conn.executemany(
+                "DELETE FROM captures WHERE id=?", [(r["id"],) for r in rows]
+            )
+            conn.execute("DELETE FROM batches WHERE id=?", (bid,))
+            deleted_capture_count += len(rows)
+            deleted_batches.append(
+                {
+                    "batch_id": bid,
+                    "filename": p["filename"],
+                    "captures": [
+                        {"url": r["url"], "captured_at": r["captured_at"]}
+                        for r in rows
+                    ],
+                }
+            )
+        broken = _missing_capture_references(conn)
+        if broken:
+            raise CleanupRejected(
+                "清理会使已保存结论 #" + "、#".join(str(r) for r in broken)
+                + " 的明细指向已删除抓存，已整体取消"
+            )
+        changed = _recheck_diff(baseline, _walk_for_reports(conn))
+        if changed:
+            raise CleanupRejected(
+                "清理会改变已保存的结论 "
+                + "、".join(f"#{rid}" for rid in changed)
+                + "，已整体取消"
+            )
+
+        detail = {
+            "cutoff": cutoff,
+            "deletable": saved.get("deletable", []),
+            "kept": saved.get("kept", []),
+            "batches": deleted_batches,
+        }
+        cur = conn.execute(
+            "INSERT INTO cleanups(preview_id, created_at, cutoff,"
+            " deleted_batch_count, deleted_capture_count, detail)"
+            " VALUES (?,?,?,?,?,?)",
+            (
+                preview_id,
+                now_us(),
+                cutoff,
+                len(deleted_batches),
+                deleted_capture_count,
+                json.dumps(detail, ensure_ascii=False),
+            ),
+        )
+        cid = cur.lastrowid
+        conn.execute(
+            "UPDATE cleanup_previews SET cleanup_id=? WHERE id=?",
+            (cid, preview_id),
+        )
+        conn.execute("COMMIT")
+        return {
+            "cleanup_id": cid,
+            "cutoff": cutoff,
+            "deleted_batch_count": len(deleted_batches),
+            "deleted_capture_count": deleted_capture_count,
+            "batch_ids": [b["batch_id"] for b in deleted_batches],
+        }
     except Exception:
         try:
             conn.execute("ROLLBACK")

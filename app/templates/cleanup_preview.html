@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}清理试算 #{{ prev.id }}{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>清理试算 #{{ prev.id }}</h2>
+  <dl class="meta">
+    <dt>截止时刻 (UTC)</dt><dd>{{ fmt_us(prev.cutoff) }}</dd>
+    <dt>试算生成时间 (UTC)</dt><dd>{{ fmt_us(prev.created_at) }}</dd>
+    <dt>可删批次</dt><dd>{{ plan.deletable|length }} 个，共
+      {{ plan.deletable|sum(attribute='capture_count') }} 条抓存</dd>
+    <dt>保留批次</dt><dd>{{ plan.kept|length }} 个</dd>
+  </dl>
+  <p class="hint">
+    可删批次：整批抓存都不晚于截止时刻，且未被任何已保存结论引用。
+    保留批次及其被依赖的结论见下表。确认时会重新核对目录与结论；若试算后有任何变化，
+    本次确认会被拒绝且不删除任何记录。
+  </p>
+  {% if cleanup %}
+  <p class="ok">本试算已确认：清理 #{{ cleanup.id }}，删除批次
+    {{ cleanup.deleted_batch_count }} 个、抓存 {{ cleanup.deleted_capture_count }} 条。
+    <a href="{{ url_for('main.cleanup_result', cid=cleanup.id) }}">查看清理结果</a></p>
+  {% elif stale %}
+  <p class="warn">试算之后目录或结论已发生变化，本试算已过时。确认会被拒绝，请重新试算。</p>
+  <form method="post" action="{{ url_for('main.cleanup_confirm', pid=prev.id) }}">
+    <button type="submit" class="secondary">仍尝试确认（将被拒绝）</button>
+  </form>
+  {% else %}
+  <form method="post" action="{{ url_for('main.cleanup_confirm', pid=prev.id) }}">
+    <button type="submit">确认清理（只删除上表可删批次）</button>
+  </form>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>可删批次（{{ plan.deletable|length }}）</h2>
+  {% if plan.deletable %}
+  <table>
+    <thead><tr><th>批次</th><th>文件名</th><th>抓存条数</th><th>批次内最晚抓存 (UTC)</th><th>上传时间 (UTC)</th></tr></thead>
+    <tbody>
+    {% for p in plan.deletable %}
+      <tr>
+        <td>#{{ p.batch_id }}</td>
+        <td>{{ p.filename }}</td>
+        <td>{{ p.capture_count }}</td>
+        <td>{{ fmt_us(p.latest_capture) }}</td>
+        <td>{{ fmt_us(p.uploaded_at) }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">删除后这些批次及其抓存不再可查；任何已保存结论都不会用到它们。</p>
+  {% else %}
+  <p class="hint">没有可删批次。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>保留批次（{{ plan.kept|length }}）</h2>
+  {% if plan.kept %}
+  <table>
+    <thead><tr><th>批次</th><th>文件名</th><th>抓存</th><th>保留原因 / 仍被哪些结论依赖</th></tr></thead>
+    <tbody>
+    {% for p in plan.kept %}
+      <tr>
+        <td>#{{ p.batch_id }}</td>
+        <td>{{ p.filename }}</td>
+        <td>{{ p.capture_count }} 条（截止内 {{ p.deletable_count }} / 截止后 {{ p.late_count }}）</td>
+        <td>
+          {% if p.reasons %}
+          <ul class="reasons">
+            {% for reason in p.reasons %}<li>{{ reason }}</li>{% endfor %}
+          </ul>
+          {% endif %}
+          {% if p.dependencies %}
+          <table class="nested">
+            <thead><tr><th>结论</th><th>回看时刻 (UTC)</th><th>依赖的页面抓存</th></tr></thead>
+            <tbody>
+            {% for d in p.dependencies %}
+              <tr>
+                <td>#{{ d.report_id }}{% if d.status != 'valid' %}（待复查）{% endif %}</td>
+                <td>{{ fmt_us(d.lookback) }}</td>
+                <td class="url">{{ d.url }} @ {{ fmt_us(d.captured_at) }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">没有保留批次。</p>
+  {% endif %}
+</section>
+{% endblock %}

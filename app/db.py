@@ -49,6 +49,28 @@ CREATE TABLE IF NOT EXISTS report_pages (
     path        TEXT,                      -- 缺档时：从入口到该 URL 的路径 JSON
     PRIMARY KEY (report_id, url)
 );
+
+-- 清理试算：保存试算时的截止时刻、目录/结论指纹与整批分析结果。
+-- confirm 时先比对指纹；只要试算后目录或结论有变化就拒绝，不产生任何副作用。
+CREATE TABLE IF NOT EXISTS cleanup_previews (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  INTEGER NOT NULL,          -- UTC 微秒
+    cutoff      INTEGER NOT NULL,          -- UTC 微秒，抓存截止时刻（含）
+    fingerprint TEXT NOT NULL,             -- 试算时目录与结论的指纹 JSON
+    plan        TEXT NOT NULL,             -- 整批清理分析结果 JSON
+    cleanup_id  INTEGER                    -- 确认成功后指向 cleanups.id
+);
+
+-- 清理结果：与批次/抓存的删除在同一事务里写入；失败则一起回滚。
+CREATE TABLE IF NOT EXISTS cleanups (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    preview_id            INTEGER NOT NULL REFERENCES cleanup_previews(id),
+    created_at            INTEGER NOT NULL, -- UTC 微秒
+    cutoff                INTEGER NOT NULL,
+    deleted_batch_count   INTEGER NOT NULL,
+    deleted_capture_count INTEGER NOT NULL,
+    detail                TEXT NOT NULL      -- 删除明细与安全检查结果 JSON
+);
 """
 
 

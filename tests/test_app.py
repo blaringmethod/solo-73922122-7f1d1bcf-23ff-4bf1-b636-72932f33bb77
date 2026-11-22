@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import create_app  # noqa: E402
+from app import logic  # noqa: E402
 from app.db import get_db  # noqa: E402
 
 T1 = "2024-01-01T00:00:00Z"
@@ -360,3 +361,330 @@ def test_pages_render(app, client):
     assert client.get("/healthz").data == b"ok"
     html = client.get(f"/reports/{rid}").get_data(as_text=True)
     assert "缺档" in html and "http://s/b" in html
+
+
+# ------------------------------------------------------------ 清理试算与确认
+
+CUTOFF = "2024-06-01T00:00"  # 晚于 T3，覆盖全部示例抓存
+
+
+def preview(client, cutoff=CUTOFF):
+    resp = client.post("/cleanup/preview", data={"cutoff": cutoff})
+    assert resp.status_code == 302
+    return int(resp.headers["Location"].rstrip("/").split("/")[-1])
+
+
+def preview_plan(app, pid):
+    return json.loads(
+        one(app, "SELECT plan FROM cleanup_previews WHERE id=?", (pid,))["plan"]
+    )
+
+
+def confirm(client, pid):
+    return client.post(f"/cleanup/{pid}/confirm")
+
+
+def deletable_ids(app, pid):
+    return [p["batch_id"] for p in preview_plan(app, pid)["deletable"]]
+
+
+def capture_count(app):
+    return one(app, "SELECT COUNT(*) AS c FROM captures")["c"]
+
+
+def test_cleanup_deletes_unreferenced_batch_whole(app, client):
+    upload(client, [("http://s/a", T1, ["http://s/b"]), ("http://s/b", T1, [])])
+    rid = check(client, "http://s/a")
+    upload(client, [("http://s/old1", T2, []), ("http://s/old2", T2, [])])
+    # 批次 2 不被任何结论引用 → 可删；批次 1 被结论选中 → 保留
+    pid = preview(client)
+    assert deletable_ids(app, pid) == [2]
+    kept = {p["batch_id"]: p for p in preview_plan(app, pid)["kept"]}
+    assert 1 in kept
+    assert any("结论 #%d" % rid in r for r in kept[1]["reasons"])
+    assert kept[1]["dependencies"][0]["report_id"] == rid
+
+    resp = confirm(client, pid)
+    assert resp.status_code == 302
+    assert one(app, "SELECT COUNT(*) AS c FROM batches WHERE id=2")["c"] == 0
+    assert one(app, "SELECT COUNT(*) AS c FROM captures WHERE url='http://s/old1'")["c"] == 0
+    assert one(app, "SELECT COUNT(*) AS c FROM batches WHERE id=1")["c"] == 1
+    assert report(app, rid)["status"] == "valid"
+    # 结论仍可复查
+    assert client.get(f"/reports/{rid}").status_code == 200
+
+
+def test_cleanup_keeps_batch_with_capture_after_cutoff(app, client):
+    upload(client, [("http://s/a", T1, []), ("http://s/future", "2024-12-01T00:00:00Z", [])])
+    pid = preview(client)  # 截止 2024-06-01，批次 1 里有一条未来抓存 → 整批保留
+    assert deletable_ids(app, pid) == []
+    kept = preview_plan(app, pid)["kept"]
+    assert any("晚于截止时刻" in r for r in kept[0]["reasons"])
+
+
+def test_cleanup_marks_dependency_for_alternate_capture_at_other_lookback(app, client):
+    """同一 URL 在不同回看时刻的替代抓存要分别核对。"""
+    upload(client, [
+        ("http://s/a", T1, ["http://s/b"]),
+        ("http://s/a", T2, ["http://s/b"]),  # A 的第二份抓存（替代）
+        ("http://s/b", T1, []),
+    ])
+    early = check(client, "http://s/a", "2024-01-15T00:00")  # 选 T1 的 A
+    late = check(client, "http://s/a", LOOKBACK)             # 选 T2 的 A
+    assert resolved_map(app, early)["http://s/a"] < resolved_map(app, late)["http://s/a"]
+    pid = preview(client)
+    # 两份 A 抓存同属批次 1；被两条结论分别引用，整批保留
+    assert deletable_ids(app, pid) == []
+    deps = preview_plan(app, pid)["kept"][0]["dependencies"]
+    assert {d["report_id"] for d in deps} == {early, late}
+
+
+def test_cleanup_keeps_missing_url_dependencies(app, client):
+    """缺档 URL 不额外依赖，但该 URL 现有抓存若被缺档结论依赖也必须保留。"""
+    upload(client, [("http://s/a", T1, ["http://s/gone"])])
+    rid = check(client, "http://s/a")
+    assert "http://s/gone" in missing_map(app, rid)
+    upload(client, [("http://s/a", T2, ["http://s/gone"])])  # A 的第二份抓存
+    pid = preview(client)
+    # 新批次里的 A 抓存是"更晚回看时刻的替代抓存"，被结论依赖，保留
+    assert 2 not in deletable_ids(app, pid)
+    assert any(
+        "结论 #%d" % rid in r or any(d["report_id"] == rid for d in p["dependencies"])
+        for p in preview_plan(app, pid)["kept"] for r in p["reasons"]
+    )
+
+
+def test_cleanup_confirm_rejected_when_catalog_changes_after_preview(app, client):
+    upload(client, [("http://s/a", T1, [])])
+    upload(client, [("http://s/unrelated", T1, [])])
+    pid = preview(client)
+    upload(client, [("http://s/new", T2, [])])  # 试算后目录变化
+    before_caps = capture_count(app)
+    before_batches = one(app, "SELECT COUNT(*) AS c FROM batches")["c"]
+    resp = confirm(client, pid)
+    assert resp.status_code == 302
+    assert capture_count(app) == before_caps
+    assert one(app, "SELECT COUNT(*) AS c FROM batches")["c"] == before_batches
+    assert one(app, "SELECT COUNT(*) AS c FROM cleanups")["c"] == 0
+    html = client.get(f"/cleanup/{pid}").get_data(as_text=True)
+    assert "拒绝" in html
+    assert "已过时" in html
+
+
+def test_cleanup_confirm_rejected_when_report_changes_after_preview(app, client):
+    upload(client, [("http://s/a", T1, ["http://s/b"]), ("http://s/b", T1, [])])
+    rid = check(client, "http://s/a")
+    pid = preview(client)
+    # 试算后再生成一条结论（甚至无关）→ 结论发生变化，拒绝
+    check(client, "http://s/a", LOOKBACK)
+    before = capture_count(app)
+    confirm(client, pid)
+    assert capture_count(app) == before
+    assert one(app, "SELECT COUNT(*) AS c FROM cleanups")["c"] == 0
+    assert report(app, rid)["status"] == "valid"
+
+
+def test_cleanup_confirm_once_only(app, client):
+    upload(client, [("http://s/a", T1, [])])
+    upload(client, [("http://s/old", T2, [])])
+    pid = preview(client)
+    assert deletable_ids(app, pid) == [1, 2]
+    confirm(client, pid)
+    assert one(app, "SELECT COUNT(*) AS c FROM cleanups")["c"] == 1
+    before = capture_count(app)
+    confirm(client, pid)  # 重复确认 → 拒绝且无副作用
+    assert capture_count(app) == before
+    assert one(app, "SELECT COUNT(*) AS c FROM cleanups")["c"] == 1
+
+
+def test_cleanup_keeps_rejected_batches(app, client):
+    upload(client, [("not-a-url", T1, [])])  # 整批退回
+    upload(client, [("http://s/a", T1, [])])
+    pid = preview(client)
+    assert deletable_ids(app, pid) == [2]
+    confirm(client, pid)
+    assert one(app, "SELECT COUNT(*) AS c FROM batches WHERE applied=0")["c"] == 1
+
+
+def test_cleanup_rejects_bad_cutoff(app, client):
+    resp = client.post("/cleanup/preview", data={"cutoff": "nope"})
+    assert resp.status_code == 302
+    assert one(app, "SELECT COUNT(*) AS c FROM cleanup_previews")["c"] == 0
+
+
+def test_cleanup_failure_leaves_archive_and_can_retry(app, client, monkeypatch):
+    """确认过程抛错时不留任何清理结果；修复后可重试成功。"""
+    upload(client, [("http://s/a", T1, []), ("http://s/old", T2, [])])
+    pid = preview(client)
+    before = capture_count(app)
+    real = logic.confirm_cleanup
+
+    def boom(conn, preview_id):
+        raise RuntimeError("模拟写清理结果失败")
+
+    monkeypatch.setattr(logic, "confirm_cleanup", boom)
+    resp = client.post(f"/cleanup/{pid}/confirm")
+    assert resp.status_code == 302  # 应用内报错被捕获并回滚，不向用户抛 500
+    html = client.get(f"/cleanup/{pid}").get_data(as_text=True)
+    assert "清理失败" in html
+    assert capture_count(app) == before
+    monkeypatch.setattr(logic, "confirm_cleanup", real)
+    # 失败后可重试，且清理结果与删除一起生效
+    confirm(client, pid)
+    assert one(app, "SELECT COUNT(*) AS c FROM cleanups")["c"] == 1
+    assert one(app, "SELECT COUNT(*) AS c FROM batches WHERE id=2")["c"] == 0
+
+
+def test_cleanup_survives_restart(tmp_path):
+    db = str(tmp_path / "cleanup.db")
+    app1 = create_app({"DATABASE": db, "TESTING": True, "SECRET_KEY": "t"})
+    c1 = app1.test_client()
+    upload(c1, [("http://s/a", T1, ["http://s/b"]), ("http://s/b", T1, [])])
+    rid = check(c1, "http://s/a")
+    upload(c1, [("http://s/old", T2, [])])
+    pid = preview(c1)
+    confirm(c1, pid)
+    app2 = create_app({"DATABASE": db, "TESTING": True, "SECRET_KEY": "t"})
+    assert one(app2, "SELECT COUNT(*) AS c FROM cleanups")["c"] == 1
+    assert one(app2, "SELECT COUNT(*) AS c FROM batches WHERE id=2")["c"] == 0
+    assert report(app2, rid)["status"] == "valid"
+    assert missing_map(app2, rid) == {}
+    html = app2.test_client().get(f"/reports/{rid}").get_data(as_text=True)
+    assert "http://s/b" in html
+
+
+def test_cleanup_pages_render(app, client):
+    upload(client, [("http://s/a", T1, [])])
+    pid = preview(client)
+    assert client.get("/cleanup").status_code == 200
+    assert client.get(f"/cleanup/{pid}").status_code == 200
+    confirm(client, pid)
+    assert client.get("/cleanups/1").status_code == 200
+    assert client.get("/cleanup/99999").status_code == 404
+
+
+def test_cleanup_rejects_report_created_between_preview_and_confirm(tmp_path):
+    """试算后即使并发新增结论，确认也必须因指纹变化被拒（不留过时清理）。"""
+    db = str(tmp_path / "race.db")
+    app = create_app({"DATABASE": db, "TESTING": True, "SECRET_KEY": "t"})
+    c = app.test_client()
+    upload(c, [("http://s/a", T1, ["http://s/b"]), ("http://s/b", T1, [])])
+    upload(c, [("http://s/old", T2, [])])
+    pid = preview(c)
+    before = capture_count(app)
+    # 直接通过业务层在确认前补一条结论（模拟另一会话）
+    with app.app_context():
+        conn = get_db()
+        logic.save_report(conn, "http://s/a", logic.to_us(logic.parse_timestamp(LOOKBACK)),
+                          2, {}, {})
+    resp = confirm(c, pid)
+    assert resp.status_code == 302
+    assert capture_count(app) == before
+    assert one(app, "SELECT COUNT(*) AS c FROM cleanups")["c"] == 0
+    assert one(app, "SELECT COUNT(*) AS c FROM batches WHERE id=2")["c"] == 1
+
+
+def test_cleanup_keeps_only_batch_with_selected_capture(app, client):
+    """同一 URL 三份抓存：删中间那份不影响结论，仍应只保护真正会被选中的。"""
+    upload(client, [
+        ("http://s/a", T1, ["http://s/b"]),
+        ("http://s/a", T2, ["http://s/b"]),
+        ("http://s/b", T1, []),
+    ])
+    # 结论在回看 T3 之前选 T2 的 A；另传一份更早的 A 抓存不会被任何结论选中
+    upload(client, [("http://s/x", "2023-01-01T00:00:00Z", [])])
+    rid = check(client, "http://s/a", LOOKBACK)
+    pid = preview(client)
+    # 批次 1 含结论所选抓存 → 保留；批次 2 与结论无关 → 可删
+    assert deletable_ids(app, pid) == [2]
+    deps = preview_plan(app, pid)["kept"][0]["dependencies"]
+    assert deps and deps[0]["report_id"] == rid
+
+
+def test_cleanup_keeps_whole_batch_if_any_capture_needed(app, client):
+    """批次里只要有一条抓存被结论选中，整批都不能删。"""
+    upload(client, [("http://s/a", T1, ["http://s/b"]), ("http://s/b", T1, [])])
+    check(client, "http://s/a")
+    # 同一批次里同时有结论用到的 A/B 和完全无关的 C
+    upload(client, [("http://s/c", T2, []), ("http://s/b", T2, [])])
+    pid = preview(client)
+    # 批次 2 含 B 的替代抓存（更晚回看时刻会选中），整批保留，C 也不能删
+    assert 2 not in deletable_ids(app, pid)
+    assert one(app, "SELECT COUNT(*) AS c FROM captures WHERE url='http://s/c'")["c"] == 1
+
+
+def test_cleanup_cutoff_inclusive(app, client):
+    upload(client, [("http://s/old", T2, [])])
+    pid = preview(client, cutoff="2024-02-01T00:00")
+    assert deletable_ids(app, pid) == [1]
+    pid2 = preview(client, cutoff="2024-01-31T23:59")
+    assert deletable_ids(app, pid2) == []
+
+
+def test_cleanup_can_delete_capture_after_missing_report_lookback(app, client):
+    """缺档 URL 在回看之后才有抓存：删掉它不会改变"缺档"结论，可以删。"""
+    upload(client, [("http://s/a", T1, ["http://s/gone"])])
+    rid = check(client, "http://s/a", "2024-01-15T00:00")
+    assert "http://s/gone" in missing_map(app, rid)
+    upload(client, [("http://s/gone", T2, [])])  # 晚于回看时刻，缺档结论不受影响
+    pid = preview(client)
+    # 批次 1 含结论选中的 A，保留；批次 2 的抓存在回看之后，删掉不影响缺档结论
+    assert deletable_ids(app, pid) == [2]
+    confirm(client, pid)
+    assert "http://s/gone" in missing_map(app, rid)
+    assert report(app, rid)["status"] == "valid"
+
+
+def test_cleanup_rolls_back_deletes_when_final_check_fails(app, client, monkeypatch):
+    """删除之后、提交之前的复核失败 → 删除与清理结果一起回滚。"""
+    upload(client, [("http://s/a", T1, [])])
+    upload(client, [("http://s/old", T2, [])])
+    pid = preview(client)
+    before_caps = capture_count(app)
+    before_batches = one(app, "SELECT COUNT(*) AS c FROM batches")["c"]
+
+    def boom(before, after):
+        raise RuntimeError("模拟复核失败")
+
+    monkeypatch.setattr(logic, "_recheck_diff", boom)
+    resp = client.post(f"/cleanup/{pid}/confirm")
+    assert resp.status_code == 302
+    assert capture_count(app) == before_caps
+    assert one(app, "SELECT COUNT(*) AS c FROM batches")["c"] == before_batches
+    assert one(app, "SELECT COUNT(*) AS c FROM cleanups")["c"] == 0
+    assert one(app, "SELECT cleanup_id FROM cleanup_previews WHERE id=?", (pid,))[0] is None
+
+
+def test_cleanup_marks_alternate_captures_in_separate_batches(app, client):
+    """同一 URL 的两份抓存在不同批次、分别被不同回看时刻的结论选中：
+    两个批次都要保留，并各自标注依赖它的结论。"""
+    upload(client, [("http://s/a", T1, ["http://s/b"]), ("http://s/b", T1, [])])
+    early = check(client, "http://s/a", "2024-01-15T00:00")  # 选批次 1 的 A
+    upload(client, [("http://s/a", T2, ["http://s/b"])])      # 批次 2：A 的替代抓存
+    late = check(client, "http://s/a", LOOKBACK)             # 选批次 2 的 A
+    pid = preview(client)
+    plan = preview_plan(app, pid)
+    assert [p["batch_id"] for p in plan["deletable"]] == []
+    by_batch = {p["batch_id"]: p for p in plan["kept"]}
+    deps1 = {(d["report_id"], d["url"]) for d in by_batch[1]["dependencies"]}
+    deps2 = {(d["report_id"], d["url"]) for d in by_batch[2]["dependencies"]}
+    assert (early, "http://s/a") in deps1
+    assert (late, "http://s/a") in deps2
+    # 两次回看选中的 A 抓存不同，按批次分别核对
+    assert resolved_map(app, early)["http://s/a"] != resolved_map(app, late)["http://s/a"]
+
+
+def test_cleanup_protects_needs_recheck_report_dependencies(app, client):
+    """待复查结论引用的抓存与其重查会选中的替代抓存都要保留。"""
+    upload(client, [("http://s/a", T1, ["http://s/b"]), ("http://s/b", T1, [])])
+    rid = check(client, "http://s/a", LOOKBACK)
+    upload(client, [("http://s/a", "2024-05-01T00:00:00Z", ["http://s/b"])])  # 待复查
+    assert report(app, rid)["status"] == "needs_recheck"
+    pid = preview(client)
+    plan = preview_plan(app, pid)
+    assert plan["deletable"] == []
+    kept = {p["batch_id"] for p in plan["kept"]}
+    assert kept == {1, 2}
+    # 依赖里明确标注了该结论
+    deps = [d for p in plan["kept"] for d in p["dependencies"]]
+    assert any(d["report_id"] == rid for d in deps)

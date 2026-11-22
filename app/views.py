@@ -26,11 +26,15 @@ def index():
     stats = conn.execute(
         "SELECT COUNT(*) AS captures, COUNT(DISTINCT url) AS urls FROM captures"
     ).fetchone()
+    cleanups = conn.execute(
+        "SELECT * FROM cleanups ORDER BY id DESC LIMIT 20"
+    ).fetchall()
     return render_template(
         "index.html",
         reports=reports,
         batches=batches,
         stats=stats,
+        cleanups=cleanups,
         fmt_us=logic.fmt_us,
     )
 
@@ -151,3 +155,94 @@ def recheck(rid):
     new_rid = _run_and_save(rep["entry_url"], rep["lookback"])
     flash(f"已按相同入口与回看时刻重新核查，生成结论 #{new_rid}", "ok")
     return redirect(url_for("main.report_detail", rid=new_rid))
+
+
+# ---------------------------------------------------------------- 清理
+
+
+def _parse_cutoff():
+    """读取并校验 UTC 截止时刻，返回 (cutoff_us, error)。"""
+    raw = (request.form.get("cutoff") or "").strip()
+    try:
+        return logic.to_us(logic.parse_timestamp(raw)), None
+    except ValueError as e:
+        return None, f"截止时刻无效：{e}"
+
+
+@bp.route("/cleanup", methods=["GET"])
+def cleanup_new():
+    return render_template("cleanup.html", fmt_us=logic.fmt_us)
+
+
+@bp.route("/cleanup/preview", methods=["POST"])
+def cleanup_preview():
+    cutoff_us, err = _parse_cutoff()
+    if err:
+        flash(err, "error")
+        return redirect(url_for("main.cleanup_new"))
+    conn = get_db()
+    pid, plan = logic.create_cleanup_preview(conn, cutoff_us)
+    return redirect(url_for("main.cleanup_detail", pid=pid))
+
+
+@bp.route("/cleanup/<int:pid>")
+def cleanup_detail(pid):
+    conn = get_db()
+    prev = conn.execute(
+        "SELECT * FROM cleanup_previews WHERE id=?", (pid,)
+    ).fetchone()
+    if prev is None:
+        abort(404)
+    plan = json.loads(prev["plan"])
+    cleanup = None
+    if prev["cleanup_id"] is not None:
+        cleanup = conn.execute(
+            "SELECT * FROM cleanups WHERE id=?", (prev["cleanup_id"],)
+        ).fetchone()
+    stale = False
+    if cleanup is None:
+        # 试算之后目录或结论是否有变化：页面上提前提示，确认时仍会严格拒绝。
+        stale = (
+            logic.fingerprint_of(conn) != prev["fingerprint"]
+        )
+    return render_template(
+        "cleanup_preview.html",
+        prev=prev,
+        plan=plan,
+        cleanup=cleanup,
+        stale=stale,
+        fmt_us=logic.fmt_us,
+    )
+
+
+@bp.route("/cleanup/<int:pid>/confirm", methods=["POST"])
+def cleanup_confirm(pid):
+    conn = get_db()
+    try:
+        result = logic.confirm_cleanup(conn, pid)
+    except logic.CleanupRejected as e:
+        flash(f"已拒绝清理（未删除任何记录）：{e.reason}", "error")
+        return redirect(url_for("main.cleanup_detail", pid=pid))
+    except Exception:
+        current_app.logger.exception("清理确认失败，已回滚")
+        flash("清理失败，原档案与清理结果均未改变，请重试或检查日志", "error")
+        return redirect(url_for("main.cleanup_detail", pid=pid))
+    flash(
+        f"清理 #{result['cleanup_id']} 已完成：删除批次 "
+        f"{result['deleted_batch_count']} 个、抓存 {result['deleted_capture_count']} 条，"
+        "结论仍可复查",
+        "ok",
+    )
+    return redirect(url_for("main.cleanup_detail", pid=pid))
+
+
+@bp.route("/cleanups/<int:cid>")
+def cleanup_result(cid):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM cleanups WHERE id=?", (cid,)).fetchone()
+    if row is None:
+        abort(404)
+    detail = json.loads(row["detail"])
+    return render_template(
+        "cleanup_result.html", cleanup=row, detail=detail, fmt_us=logic.fmt_us
+    )
